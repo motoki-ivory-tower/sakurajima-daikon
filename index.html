@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>桜島だいこん</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    touch-action: none; overscroll-behavior: none;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c" width="640" height="480"></canvas>
+<script>
+"use strict";
+
+// ================= 調整用の値（ここだけ触ればOK） =================
+// 難しさのねらい：100人が1回ずつ遊んで、50点を超える（51点以上）のは約1人（2026-11-18 自動プレイで調整。丸い大根は1回に約54本）
+const CONFIG = {
+  GAME_TIME: 60,         // 1回の時間（秒）
+  LIVES: 3,              // 普通の大根を何本取ったら終わりか
+  PIG_FOLLOW: 0.35,      // 黒豚君がマウス・指に追いつく速さ（0〜1。大きいほど速い）
+  PIG_KEY_SPEED: 10,     // ←→キーで動く速さ（px/フレーム）
+  FALL_SPEED_MIN: 3.0,   // 大根の落ちる速さ・最小（px/フレーム）
+  FALL_SPEED_MAX: 4.5,   // 大根の落ちる速さ・最大
+  FALL_SPEED_END: 1.6,   // 終了時には落ちる速さが何倍になるか（1なら変わらない）
+  SPAWN_START: 32,       // 大根が出る間隔・開始時（フレーム。30で1秒）。もとは 30
+  SPAWN_END: 14,         // 大根が出る間隔・終了時
+  NORMAL_RATIO: 0.35,    // 普通の大根が混ざる割合（0〜1）。もとは 0.325
+  ASH_START: 30,         // 火山灰の下のふち・開始時（画面の上からpx）
+  ASH_END: 260,          // 火山灰の下のふち・終了時（黒豚君の頭は約390）。もとは 290
+  ERUPT_START: 4,        // 噴火の間隔・開始時（秒）
+  ERUPT_END: 1.5,        // 噴火の間隔・終了時（秒）
+  IDLE_RESET: 30,        // 操作がないとタイトルに戻るまで（秒）
+  RESULT_WAIT: 2,        // 結果画面で次のゲームを始められるまで（秒）
+  RESULT_TIMEOUT: 15,    // 結果画面から自動でタイトルに戻るまで（秒）
+  DEBUG: false           // 展示前チェック：false になっているか（true だと D キーで残り10秒へ飛び、右下に DEBUG と出る）
+};
+// ==================================================================
+
+const W = 640, H = 480, FPS = 30, STEP = 1000 / FPS;
+const GROUND = 440;              // 黒豚君の足もと
+const CATCH_Y = GROUND - 48;     // 黒豚君の頭（受け止める高さ）
+const PIG_HALF = 28;             // 受け止める幅の半分
+const CRATER = { x: 312, y: 300 };
+
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+
+// ---------- 画面サイズ：比率を保って拡大 ----------
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = Math.floor(W * s) + "px";
+  cv.style.height = Math.floor(H * s) + "px";
+}
+addEventListener("resize", fit);
+fit();
+
+// ---------- 誤操作の封じ込め ----------
+["contextmenu", "selectstart", "dragstart", "gesturestart", "dblclick"].forEach(
+  (n) => addEventListener(n, (e) => e.preventDefault())
+);
+addEventListener("wheel", (e) => e.preventDefault(), { passive: false });
+addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+
+// ---------- 状態 ----------
+let state, t, pig, items, popups, flakes, puffs, rocks;
+let score, lives, spawnTimer, eruptTimer, eruptGlow, shake, hurtFlash, resultT;
+let pointerX = null, lastInput = performance.now();
+const keys = {};
+
+const lerp = (a, b, k) => a + (b - a) * k;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rand = (a, b) => a + Math.random() * (b - a);
+
+function resetWorld() {
+  t = 0; items = []; popups = []; flakes = []; puffs = []; rocks = [];
+  score = 0; lives = CONFIG.LIVES; spawnTimer = 0; eruptTimer = 0;
+  eruptGlow = 0; shake = 0; hurtFlash = 0; resultT = 0;
+  pig = { x: W / 2, vx: 0, hurt: 0, bounce: 0 };
+}
+function toTitle() { resetWorld(); state = "title"; }
+function startGame() { resetWorld(); state = "play"; lastInput = performance.now(); }
+function endGame() { state = "result"; resultT = 0; }
+
+// ゲームの進み具合 0〜1（タイトルのデモ中は少しだけ進んだ状態）
+function progress() { return state === "title" ? 0.25 : clamp(t / CONFIG.GAME_TIME, 0, 1); }
+function ashY() { return lerp(CONFIG.ASH_START, CONFIG.ASH_END, progress()); }
+
+// ---------- 入力 ----------
+function gameX(e) {
+  const r = cv.getBoundingClientRect();
+  return clamp(((e.clientX - r.left) / r.width) * W, 0, W);
+}
+function poke() { lastInput = performance.now(); }
+function press() {
+  if (state === "title") startGame();
+  else if (state === "result" && resultT > CONFIG.RESULT_WAIT) startGame();
+}
+addEventListener("pointermove", (e) => { pointerX = gameX(e); poke(); });
+addEventListener("pointerdown", (e) => { pointerX = gameX(e); poke(); press(); });
+addEventListener("keydown", (e) => {
+  keys[e.key] = true; poke();
+  if (e.key.startsWith("Arrow")) pointerX = null;
+  if (e.key === " " || e.key === "Enter") press();
+  if (CONFIG.DEBUG && (e.key === "d" || e.key === "D") && state === "play") {
+    t = Math.max(t, CONFIG.GAME_TIME - 10);
+  }
+});
+addEventListener("keyup", (e) => { keys[e.key] = false; });
+addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
+
+// ---------- 更新 ----------
+function spawnDaikon() {
+  const normal = Math.random() < CONFIG.NORMAL_RATIO;
+  items.push({
+    x: rand(30, W - 30), y: -40,
+    vy: rand(CONFIG.FALL_SPEED_MIN, CONFIG.FALL_SPEED_MAX) * lerp(1, CONFIG.FALL_SPEED_END, progress()),
+    normal, rot: rand(-0.3, 0.3), vr: rand(-0.06, 0.06),
+    hw: normal ? 7 : 16, bottom: normal ? 26 : 16
+  });
+}
+
+function erupt() {
+  eruptGlow = 12;
+  shake = Math.max(shake, 4);
+  for (let i = 0; i < 6; i++) {
+    puffs.push({ x: CRATER.x + rand(-10, 10), y: CRATER.y, r: rand(10, 18), vy: rand(-2.5, -1.5), vx: rand(-0.6, 0.6) });
+  }
+  for (let i = 0; i < 8; i++) {
+    rocks.push({ x: CRATER.x, y: CRATER.y, vx: rand(-3, 3), vy: rand(-7, -4), life: 40 });
+  }
+}
+
+function addPopup(x, y, text, color) {
+  popups.push({ x, y, text, color, life: 24 });
+}
+
+function movePig() {
+  const before = pig.x;
+  if (state === "title") {
+    // デモ：いちばん下にある桜島大根を追いかける
+    let target = null;
+    for (const it of items) {
+      if (!it.normal && it.y > ashY() - 10 && (!target || it.y > target.y)) target = it;
+    }
+    pig.x += ((target ? target.x : W / 2) - pig.x) * 0.12;
+  } else if (state === "play") {
+    const left = keys["ArrowLeft"], right = keys["ArrowRight"];
+    if (left || right) {
+      pig.x += (right ? 1 : 0) * CONFIG.PIG_KEY_SPEED - (left ? 1 : 0) * CONFIG.PIG_KEY_SPEED;
+    } else if (pointerX !== null) {
+      pig.x += (pointerX - pig.x) * CONFIG.PIG_FOLLOW;
+    }
+  }
+  pig.x = clamp(pig.x, PIG_HALF + 4, W - PIG_HALF - 4);
+  pig.vx = pig.x - before;
+}
+
+function update() {
+  const p = progress();
+
+  if (state === "play") {
+    t += 1 / FPS;
+    if (t >= CONFIG.GAME_TIME) endGame();
+    if (performance.now() - lastInput > CONFIG.IDLE_RESET * 1000) { toTitle(); return; }
+  } else if (state === "result") {
+    resultT += 1 / FPS;
+    if (resultT > CONFIG.RESULT_TIMEOUT) { toTitle(); return; }
+  }
+
+  // 大根を出す（結果画面では止める）
+  if (state !== "result") {
+    spawnTimer--;
+    if (spawnTimer <= 0) {
+      spawnDaikon();
+      spawnTimer = Math.round(lerp(CONFIG.SPAWN_START, CONFIG.SPAWN_END, p));
+    }
+  }
+
+  // 噴火
+  eruptTimer -= 1 / FPS;
+  if (eruptTimer <= 0) {
+    erupt();
+    eruptTimer = lerp(CONFIG.ERUPT_START, CONFIG.ERUPT_END, p);
+  }
+
+  movePig();
+
+  // 大根の落下と受け止め
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.y += it.vy;
+    it.rot += it.vr;
+    const caught =
+      state !== "result" &&
+      it.y + it.bottom >= CATCH_Y && it.y <= GROUND - 10 &&
+      Math.abs(it.x - pig.x) < PIG_HALF + it.hw * 0.5;
+    if (caught) {
+      items.splice(i, 1);
+      if (it.normal) {
+        addPopup(pig.x, CATCH_Y - 20, "✕", "#ff4a3d");
+        pig.hurt = 20; shake = 10; hurtFlash = 6;
+        if (state === "play") { lives--; if (lives <= 0) endGame(); }
+      } else {
+        addPopup(pig.x, CATCH_Y - 20, "+1", "#ffe14a");
+        pig.bounce = 6;
+        if (state === "play") score++;
+      }
+    } else if (it.y > H + 40) {
+      items.splice(i, 1);
+    }
+  }
+
+  // 演出（数を上限で抑える）
+  pig.bounce *= 0.7; if (pig.hurt > 0) pig.hurt--;
+  shake *= 0.85; if (hurtFlash > 0) hurtFlash--; if (eruptGlow > 0) eruptGlow--;
+
+  for (let i = popups.length - 1; i >= 0; i--) {
+    const q = popups[i]; q.y -= 1.5; if (--q.life <= 0) popups.splice(i, 1);
+  }
+  if (flakes.length < 80) flakes.push({ x: rand(0, W), y: ashY(), vy: rand(0.6, 1.6), life: rand(40, 90) });
+  for (let i = flakes.length - 1; i >= 0; i--) {
+    const f = flakes[i]; f.y += f.vy; f.x += Math.sin((f.y + f.life) * 0.05) * 0.3;
+    if (--f.life <= 0 || f.y > GROUND) flakes.splice(i, 1);
+  }
+  if (puffs.length < 60 && Math.random() < 0.35) {
+    puffs.push({ x: CRATER.x + rand(-6, 6), y: CRATER.y, r: rand(8, 12), vy: rand(-1.4, -0.8), vx: rand(-0.3, 0.3) });
+  }
+  for (let i = puffs.length - 1; i >= 0; i--) {
+    const u = puffs[i]; u.y += u.vy; u.x += u.vx; u.r += 0.25;
+    if (u.y + u.r < -10 || puffs.length > 90) puffs.splice(i, 1);
+  }
+  for (let i = rocks.length - 1; i >= 0; i--) {
+    const r = rocks[i]; r.x += r.vx; r.y += r.vy; r.vy += 0.35;
+    if (--r.life <= 0) rocks.splice(i, 1);
+  }
+}
+
+// ---------- 描画 ----------
+function leaf(x, y, a, len) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(a);
+  ctx.beginPath(); ctx.ellipse(0, -len / 2, 4, len / 2, 0, 0, Math.PI * 2);
+  ctx.fillStyle = "#3f8f3a"; ctx.fill();
+  ctx.strokeStyle = "#1f3d1c"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+}
+
+// 桜島大根：丸い
+function drawRound(x, y, rot, s) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s);
+  leaf(-7, -12, -0.6, 18); leaf(7, -12, 0.6, 18); leaf(0, -14, 0, 22);
+  ctx.lineWidth = 2; ctx.strokeStyle = "#4a4038";
+  ctx.beginPath(); ctx.moveTo(-3, 13); ctx.lineTo(0, 24); ctx.lineTo(3, 13);
+  ctx.fillStyle = "#e8e2d6"; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, 0, 16, 0, Math.PI * 2);
+  ctx.fillStyle = "#f6f2ea"; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(-5, -5, 5, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffffff"; ctx.fill();
+  ctx.restore();
+}
+
+// 普通の大根：細長い
+function drawLong(x, y, rot, s) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s);
+  leaf(-4, -18, -0.5, 16); leaf(4, -18, 0.5, 16); leaf(0, -20, 0, 20);
+  ctx.beginPath();
+  ctx.moveTo(-7, -20); ctx.lineTo(7, -20);
+  ctx.quadraticCurveTo(8, 10, 1, 26); ctx.lineTo(-1, 26);
+  ctx.quadraticCurveTo(-8, 10, -7, -20); ctx.closePath();
+  ctx.fillStyle = "#f6f2ea"; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = "#4a4038"; ctx.stroke();
+  ctx.fillStyle = "#cfe3b0"; ctx.fillRect(-6, -19, 12, 7);
+  ctx.restore();
+}
+
+// 黒豚君（正面）
+function drawPig(x) {
+  const by = GROUND - pig.bounce;
+  const hurtBlink = pig.hurt > 0 && Math.floor(pig.hurt / 3) % 2 === 0;
+  const body = hurtBlink ? "#7a1a14" : "#1b1b1f";
+  const lean = clamp(pig.vx * 0.02, -0.2, 0.2);
+  ctx.save(); ctx.translate(x, by); ctx.rotate(lean);
+  // 足
+  ctx.fillStyle = "#0e0e10";
+  ctx.fillRect(-20, -8, 10, 8); ctx.fillRect(10, -8, 10, 8);
+  // 胴
+  ctx.beginPath(); ctx.ellipse(0, -18, 28, 16, 0, 0, Math.PI * 2); ctx.fillStyle = body; ctx.fill();
+  // 耳
+  ctx.beginPath(); ctx.moveTo(-17, -42); ctx.lineTo(-10, -56); ctx.lineTo(-4, -46); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(17, -42); ctx.lineTo(10, -56); ctx.lineTo(4, -46); ctx.fill();
+  // 頭
+  ctx.beginPath(); ctx.arc(0, -34, 18, 0, Math.PI * 2); ctx.fill();
+  // 目
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(-7, -40, 3.5, 0, Math.PI * 2); ctx.arc(7, -40, 3.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#000";
+  ctx.beginPath(); ctx.arc(-7, -40, 1.6, 0, Math.PI * 2); ctx.arc(7, -40, 1.6, 0, Math.PI * 2); ctx.fill();
+  // 鼻
+  ctx.beginPath(); ctx.ellipse(0, -29, 9, 6, 0, 0, Math.PI * 2); ctx.fillStyle = "#8c6b6b"; ctx.fill();
+  ctx.fillStyle = "#3a2626";
+  ctx.fillRect(-4, -31, 2, 4); ctx.fillRect(2, -31, 2, 4);
+  // 口（取った直後は開く）
+  if (pig.bounce > 1) {
+    ctx.beginPath(); ctx.arc(0, -21, 4, 0, Math.PI); ctx.fillStyle = "#c94a4a"; ctx.fill();
+  }
+  ctx.restore();
+}
+
+function heart(x, y, on) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.beginPath();
+  ctx.moveTo(0, 6);
+  ctx.bezierCurveTo(-10, -2, -6, -10, 0, -4);
+  ctx.bezierCurveTo(6, -10, 10, -2, 0, 6);
+  ctx.fillStyle = on ? "#ff5a5a" : "#55504c"; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke();
+  ctx.restore();
+}
+
+function text(str, x, y, size, color, align) {
+  ctx.font = `bold ${size}px "Hiragino Kaku Gothic ProN","Yu Gothic UI","Meiryo",sans-serif`;
+  ctx.textAlign = align || "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = Math.max(3, size / 6); ctx.strokeStyle = "#000"; ctx.strokeText(str, x, y);
+  ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+
+function drawBackground(p) {
+  // 空
+  const g = ctx.createLinearGradient(0, 0, 0, 380);
+  g.addColorStop(0, "#7fb8e6"); g.addColorStop(1, "#e7d9c0");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 380);
+  // 海（錦江湾）
+  ctx.fillStyle = "#2f6f9a"; ctx.fillRect(0, 370, W, GROUND - 370);
+  // 噴煙
+  for (const u of puffs) {
+    ctx.beginPath(); ctx.arc(u.x, u.y, u.r, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(110,104,98,0.85)"; ctx.fill();
+  }
+  // 桜島（ふたつの峰）
+  ctx.beginPath();
+  ctx.moveTo(90, 396); ctx.lineTo(200, 345); ctx.lineTo(258, 312); ctx.lineTo(284, 299);
+  ctx.lineTo(300, 306); ctx.lineTo(318, 297); ctx.lineTo(342, 304); ctx.lineTo(372, 318);
+  ctx.lineTo(432, 350); ctx.lineTo(550, 396); ctx.closePath();
+  ctx.fillStyle = "#5b4a42"; ctx.fill();
+  // 火口の光
+  if (eruptGlow > 0) {
+    ctx.beginPath(); ctx.arc(CRATER.x, CRATER.y, 10 + eruptGlow * 2, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,140,40,${eruptGlow / 14})`; ctx.fill();
+  }
+  for (const r of rocks) { ctx.fillStyle = "#ff8a2a"; ctx.fillRect(r.x - 2, r.y - 2, 4, 4); }
+  // 地面
+  ctx.fillStyle = "#2a2522"; ctx.fillRect(0, GROUND, W, H - GROUND);
+  ctx.fillStyle = "#3a332e"; for (let x = 0; x < W; x += 24) ctx.fillRect(x, GROUND, 12, 3);
+  // 灰で全体が少しずつ暗くなる
+  ctx.fillStyle = `rgba(60,50,45,${p * 0.35})`; ctx.fillRect(0, 0, W, H);
+}
+
+function drawAsh() {
+  const y = ashY(), k = performance.now() * 0.002;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(W, 0); ctx.lineTo(W, y);
+  for (let x = W; x >= 0; x -= 16) ctx.lineTo(x, y + Math.sin(x * 0.05 + k) * 5 + Math.sin(x * 0.13 - k) * 3);
+  ctx.closePath();
+  ctx.fillStyle = "#3d3936"; ctx.fill();
+  ctx.fillStyle = "rgba(160,150,140,0.8)";
+  for (const f of flakes) ctx.fillRect(f.x, f.y, 2, 2);
+}
+
+function drawHUD() {
+  drawRound(28, 28, 0, 0.8);
+  text("× " + score, 52, 28, 22, "#fff", "left");
+  const remain = Math.max(0, Math.ceil(CONFIG.GAME_TIME - t));
+  text(String(remain), W - 24, 28, 26, remain <= 10 ? "#ffb84a" : "#fff", "right");
+  for (let i = 0; i < CONFIG.LIVES; i++) heart(W / 2 - (CONFIG.LIVES - 1) * 14 + i * 28, 28, i < lives);
+}
+
+function panel(x, y, w, h) {
+  ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+}
+
+function drawTitle() {
+  panel(130, 110, 380, 200);
+  text("桜島だいこん", W / 2, 148, 40, "#fff");
+  text("SAKURAJIMA DAIKON", W / 2, 182, 16, "#ddd");
+  drawRound(250, 232, 0, 1);  text("○", 290, 232, 30, "#ffe14a");
+  drawLong(370, 232, 0, 1);   text("✕", 405, 232, 30, "#ff4a3d");
+  if (Math.floor(performance.now() / 500) % 2 === 0) {
+    text("タッチでスタート / Tap to start", W / 2, 286, 18, "#fff");
+  }
+}
+
+function drawResult() {
+  panel(150, 120, 340, 190);
+  text("おわり / FINISH", W / 2, 158, 30, "#fff");
+  drawRound(W / 2 - 50, 222, 0, 1.6);
+  text("× " + score, W / 2 + 30, 222, 44, "#ffe14a");
+  if (resultT > CONFIG.RESULT_WAIT && Math.floor(performance.now() / 500) % 2 === 0) {
+    text("タッチでもう一回 / Tap to play again", W / 2, 282, 16, "#fff");
+  }
+}
+
+function draw() {
+  ctx.save();
+  if (shake > 0.5) ctx.translate(rand(-shake, shake), rand(-shake, shake));
+  drawBackground(progress());
+  for (const it of items) {
+    if (it.normal) drawLong(it.x, it.y, it.rot, 1); else drawRound(it.x, it.y, it.rot, 1);
+  }
+  drawPig(pig.x);
+  drawAsh();
+  for (const q of popups) text(q.text, q.x, q.y, 26, q.color);
+  ctx.restore();
+
+  if (hurtFlash > 0) { ctx.fillStyle = `rgba(255,40,30,${hurtFlash * 0.05})`; ctx.fillRect(0, 0, W, H); }
+  if (state === "title") drawTitle();
+  else { drawHUD(); if (state === "result") drawResult(); }
+  if (CONFIG.DEBUG) text("DEBUG", W - 8, H - 12, 12, "#f0f", "right");
+}
+
+// ---------- ループ（30FPS固定・エラーが出ても最初から） ----------
+let acc = 0, last = null;
+function loop(ts) {
+  requestAnimationFrame(loop);
+  if (last === null) last = ts;
+  acc += clamp(ts - last, 0, 250); last = ts;
+  try {
+    while (acc >= STEP) { update(); acc -= STEP; }
+    draw();
+  } catch (err) {
+    console.error(err);
+    acc = 0; toTitle();
+  }
+}
+toTitle();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
